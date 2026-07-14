@@ -841,6 +841,14 @@ class VllmConfig:
 
         if (
             self.model_config is not None
+            and self.model_config.enable_return_routed_expert_scores
+            and not self.model_config.enable_return_routed_experts
+        ):
+            # Score capture rides on the routed-experts plumbing.
+            self.model_config.enable_return_routed_experts = True
+
+        if (
+            self.model_config is not None
             and self.model_config.enable_return_routed_experts
         ):
             if self.parallel_config.pipeline_parallel_size > 1:

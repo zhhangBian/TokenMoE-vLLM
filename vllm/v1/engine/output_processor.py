@@ -177,6 +177,9 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
+        # Router score chunks aligned with routed_experts_chunks; stays
+        # empty when score capture is disabled.
+        self.routed_expert_scores_chunks: list[np.ndarray] = []
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -396,14 +399,20 @@ class RequestState:
 
         # Concatenate routed experts on finish
         routed_experts = None
+        routed_expert_scores = None
         if finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
+            if self.routed_expert_scores_chunks:
+                routed_expert_scores = np.concatenate(
+                    self.routed_expert_scores_chunks, axis=0
+                )
 
         return CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            routed_expert_scores=routed_expert_scores,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -624,6 +633,10 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+                if engine_core_output.routed_expert_scores is not None:
+                    req_state.routed_expert_scores_chunks.append(
+                        engine_core_output.routed_expert_scores
+                    )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

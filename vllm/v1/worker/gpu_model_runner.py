@@ -3563,6 +3563,12 @@ class GPUModelRunner(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
                 )
+                if self.routed_expert_scores_cpu is not None:
+                    score_buf = self.routed_experts_capturer.get_score_device_buffer()
+                    assert score_buf is not None
+                    self.routed_expert_scores_cpu[:total].copy_(
+                        score_buf[:total], non_blocking=True
+                    )
 
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -4537,6 +4543,9 @@ class GPUModelRunner(
                 output.routed_experts = RoutedExpertsLists(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+                    score_data=self.routed_expert_scores_cpu[:total].numpy()
+                    if self.routed_expert_scores_cpu is not None
+                    else None,
                 )
             return output
 
@@ -4558,12 +4567,16 @@ class GPUModelRunner(
             routed_experts_snapshot = None
             if self.routed_experts_initialized:
                 buf = self.routed_experts_capturer.get_device_buffer()
+                score_buf = self.routed_experts_capturer.get_score_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
                 routed_experts_snapshot = RoutedExpertsTensors(
                     routing_data=buf[:total].clone(),
                     slot_mapping=self.routed_experts_slot_mapping_device[
                         :total
                     ].clone(),
+                    score_data=score_buf[:total].clone()
+                    if score_buf is not None
+                    else None,
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
@@ -7207,8 +7220,11 @@ class GPUModelRunner(
 
     def init_routed_experts_capturer(self):
         logger.info(
-            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            "Initializing routed experts capturer, "
+            "enable_return_routed_experts: %s, "
+            "enable_return_routed_expert_scores: %s",
             self.model_config.enable_return_routed_experts,
+            self.model_config.enable_return_routed_expert_scores,
         )
         self.routed_experts_capturer = RoutedExpertsCapturer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
@@ -7226,6 +7242,17 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        # Pinned CPU twin for the router-score buffer (sync path only,
+        # like ``routed_experts_cpu``). None when score capture is off.
+        self.routed_expert_scores_cpu: torch.Tensor | None = None
+        score_buf = self.routed_experts_capturer.get_score_device_buffer()
+        if score_buf is not None:
+            self.routed_expert_scores_cpu = torch.empty(
+                score_buf.shape,
+                dtype=score_buf.dtype,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
         # ``slot_mapping`` dtype is fixed to int64 by
         # ``block_table.slot_mapping``; we mirror that here.
         max_tokens = self.scheduler_config.max_num_batched_tokens
@@ -7257,8 +7284,10 @@ class GPUModelRunner(
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
                 layer_id = module.layer_id
 
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
+                def _capture_fn(
+                    topk_ids, topk_weights, _layer_id=layer_id, _capturer=capturer
+                ):
+                    _capturer.capture(_layer_id, topk_ids, topk_weights)
 
                 module.router.set_capture_fn(_capture_fn)
 

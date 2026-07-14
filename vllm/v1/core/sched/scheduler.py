@@ -1324,14 +1324,18 @@ class Scheduler(SchedulerInterface):
         # requests may terminate on tokens generated in this very step,
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
+        score_data = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
             re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
+            self.routed_experts_mgr.store_batch(
+                re.routing_data, re.slot_mapping, scores=re.score_data
+            )
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
             )
+            score_data = re.score_data
             # Build offset map using model runner's request order
             # (input_batch ordering), NOT scheduler dict order.
             offset = 0
@@ -1431,6 +1435,7 @@ class Scheduler(SchedulerInterface):
                     stopped = True
 
             routed_experts = None
+            routed_expert_scores = None
             if (
                 self.enable_return_routed_experts
                 and routing_data is not None
@@ -1459,6 +1464,11 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens,
                         token_start=prompt_start,
                     )
+                    routed_expert_scores = self.routed_experts_mgr.get_scores(
+                        block_ids,
+                        request.num_prompt_tokens,
+                        token_start=prompt_start,
+                    )
                 else:
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
@@ -1466,9 +1476,17 @@ class Scheduler(SchedulerInterface):
                         routed_experts = routing_data[
                             req_offset : req_offset + len(new_token_ids)
                         ]
+                        if score_data is not None:
+                            routed_expert_scores = score_data[
+                                req_offset : req_offset + len(new_token_ids)
+                            ]
                     else:
                         # Normal decode / re-prefill: token(s) at the END.
                         routed_experts = routing_data[end - len(new_token_ids) : end]
+                        if score_data is not None:
+                            routed_expert_scores = score_data[
+                                end - len(new_token_ids) : end
+                            ]
 
             finish_reason = None
             if stopped:
@@ -1518,6 +1536,7 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
+                        routed_expert_scores=routed_expert_scores,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

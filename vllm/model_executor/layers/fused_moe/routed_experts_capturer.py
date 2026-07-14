@@ -104,10 +104,29 @@ class RoutedExpertsCapturer:
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        # Optional aligned router-score buffer. fp16 is enough: the
+        # captured values are the router's top-k combine weights (post
+        # top-k selection / renormalization), typically in [0, 1] up to
+        # a model-specific scaling factor.
+        self.capture_scores = (
+            vllm_config.model_config.enable_return_routed_expert_scores
+        )
+        self.score_device_buffer: torch.Tensor | None = None
+        if self.capture_scores:
+            self.score_device_buffer = torch.zeros(
+                self.device_buffer.shape,
+                dtype=torch.float16,
+                device=current_platform.device_type,
+            )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+    ) -> None:
         """Capture expert routing decisions for a specific layer.
 
         Under data parallelism, ``topk_ids`` may have three different batch
@@ -133,7 +152,16 @@ class RoutedExpertsCapturer:
         Args:
             layer_id: The layer index.
             topk_ids: Tensor of shape (batch_size, num_routed_experts).
+            topk_weights: Optional tensor of shape
+                (batch_size, num_routed_experts), row-aligned with
+                ``topk_ids``. Only consumed when score capture is
+                enabled; sliced/gathered with the exact same batch
+                layout logic as ``topk_ids`` so IDs and scores can
+                never misalign.
         """
+        capture_weights = (
+            self.score_device_buffer is not None and topk_weights is not None
+        )
 
         ctx = get_forward_context()
         if ctx.dp_metadata is None:  # single dp
@@ -180,6 +208,11 @@ class RoutedExpertsCapturer:
                 # downstream ``device_buffer[...] = topk_ids[...]``
                 # setitem narrows into int32 automatically.
                 topk_ids = get_tp_group().all_gather(topk_ids, dim=0)
+                if capture_weights:
+                    assert topk_weights is not None
+                    # Same SP shard layout as topk_ids; gather in
+                    # lockstep so rows stay aligned.
+                    topk_weights = get_tp_group().all_gather(topk_weights, dim=0)
                 start_loc = 0
                 end_loc = token_num_per_dp
             else:
@@ -203,13 +236,22 @@ class RoutedExpertsCapturer:
         self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
             start_loc:end_loc, :
         ]
+        if capture_weights:
+            assert self.score_device_buffer is not None
+            assert topk_weights is not None
+            # Same slicing as topk_ids; setitem narrows fp32 -> fp16.
+            self.score_device_buffer[:token_num_per_dp, layer_id, :] = topk_weights[
+                start_loc:end_loc, :
+            ]
 
     def clear_buffer(self) -> None:
-        """Zero the device buffer. Called at the start of every step so
-        slots belonging to finished / preempted tokens don't leak into
-        the next step.
+        """Zero the device buffer(s). Called at the start of every step
+        so slots belonging to finished / preempted tokens don't leak
+        into the next step.
         """
         self.device_buffer.zero_()
+        if self.score_device_buffer is not None:
+            self.score_device_buffer.zero_()
 
     def get_device_buffer(self) -> torch.Tensor:
         """Return the underlying device buffer so the model runner can
@@ -218,6 +260,13 @@ class RoutedExpertsCapturer:
         :meth:`clear_buffer`.
         """
         return self.device_buffer
+
+    def get_score_device_buffer(self) -> torch.Tensor | None:
+        """Return the router-score device buffer (or None when score
+        capture is disabled). Same sharing caveats as
+        :meth:`get_device_buffer`.
+        """
+        return self.score_device_buffer
 
 
 class RoutedExpertsManager:
@@ -294,15 +343,45 @@ class RoutedExpertsManager:
             hf_config.num_experts_per_tok,
             self.routed_experts_by_slot.dtype.name,
         )
+        # Optional aligned router-score slot buffer. fp16 keeps the
+        # additional memory bounded (2 bytes/slot-entry) while retaining
+        # enough resolution for post-softmax routing weights.
+        self.capture_scores = (
+            vllm_config.model_config.enable_return_routed_expert_scores
+        )
+        self.routed_expert_scores_by_slot: np.ndarray | None = None
+        if self.capture_scores:
+            self.routed_expert_scores_by_slot = np.zeros(
+                self.routed_experts_by_slot.shape,
+                dtype=np.float16,
+            )
+            logger.info(
+                "RoutedExpertsManager score CPU buffer: %.2f GB "
+                "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
+                self.routed_expert_scores_by_slot.nbytes / 1e9,
+                max_num_slots,
+                hf_config.num_hidden_layers,
+                num_experts_per_tok,
+                self.routed_expert_scores_by_slot.dtype.name,
+            )
 
-    def store_batch(self, data: np.ndarray, slot_mapping: np.ndarray) -> None:
+    def store_batch(
+        self,
+        data: np.ndarray,
+        slot_mapping: np.ndarray,
+        scores: np.ndarray | None = None,
+    ) -> None:
         """Persist one step's routed experts into the slot buffer.
 
         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
         indexing handles repeated / out-of-order indices. Called once
-        per scheduler step in ``update_from_output``.
+        per scheduler step in ``update_from_output``. ``scores`` shares
+        ``slot_mapping`` with ``data`` and is only stored when score
+        capture is enabled.
         """
         self.routed_experts_by_slot[slot_mapping] = data
+        if self.routed_expert_scores_by_slot is not None and scores is not None:
+            self.routed_expert_scores_by_slot[slot_mapping] = scores
 
     def get(
         self,
@@ -335,6 +414,31 @@ class RoutedExpertsManager:
             Array of shape (num_tokens - token_start, num_layers,
             num_experts_per_tok).
         """
+        slot_mapping = self._slot_mapping(block_ids, num_tokens, token_start)
+        return self.routed_experts_by_slot[slot_mapping]
+
+    def get_scores(
+        self,
+        block_ids: list[int],
+        num_tokens: int,
+        token_start: int = 0,
+    ) -> np.ndarray | None:
+        """Read router scores for a completed / preempted request.
+
+        Same slot reconstruction and copy semantics as :meth:`get`.
+        Returns None when score capture is disabled.
+        """
+        if self.routed_expert_scores_by_slot is None:
+            return None
+        slot_mapping = self._slot_mapping(block_ids, num_tokens, token_start)
+        return self.routed_expert_scores_by_slot[slot_mapping]
+
+    def _slot_mapping(
+        self,
+        block_ids: list[int],
+        num_tokens: int,
+        token_start: int,
+    ) -> np.ndarray:
         bs = self.block_size
         block_ids_array = np.array(block_ids, dtype=np.int32)
         block_offsets = np.arange(bs)
@@ -345,5 +449,4 @@ class RoutedExpertsManager:
         slot_mapping = (
             block_ids_array.reshape(-1, 1) * bs + block_offsets.reshape(1, -1)
         ).flatten()[:num_tokens]
-        slot_mapping = slot_mapping[token_start:]
-        return self.routed_experts_by_slot[slot_mapping]
+        return slot_mapping[token_start:]

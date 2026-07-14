@@ -170,10 +170,13 @@ class BaseRouter(FusedMoERouter):
         self.global_num_experts = global_num_experts
         self.eplb_state = eplb_state
         self.indices_type_getter = indices_type_getter
-        self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
 
-    def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
-        """Set a capture callback for logical routed expert IDs."""
+    def set_capture_fn(
+        self, capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None
+    ) -> None:
+        """Set a capture callback for logical routed expert IDs and the
+        router top-k weights aligned with them."""
         self.capture_fn = capture_fn
 
     def _validate_eplb_state(self) -> None:
@@ -285,9 +288,10 @@ class BaseRouter(FusedMoERouter):
             hidden_states, router_logits, indices_type, input_ids=input_ids
         )
 
-        # Capture logical ids before EPLB mapping.
+        # Capture logical ids (and aligned router weights) before EPLB
+        # mapping and before any indices dtype conversion.
         if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
+            self.capture_fn(topk_ids, topk_weights)
 
         # Step 4: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

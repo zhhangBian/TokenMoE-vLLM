@@ -231,6 +231,9 @@ class ModelConfig:
     flexibility."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
+    enable_return_routed_expert_scores: bool = False
+    """Whether to additionally return router top-k scores aligned with the
+    returned routed expert IDs. Implies `enable_return_routed_experts`."""
     max_logprobs: int = 20
     """Maximum number of log probabilities to return when `logprobs` is
     specified in `SamplingParams`. The default value comes the default for the

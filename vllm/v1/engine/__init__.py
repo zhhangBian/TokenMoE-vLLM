@@ -189,6 +189,9 @@ class EngineCoreOutput(
     prefill_stats: PrefillStats | None = None
 
     routed_experts: np.ndarray | None = None
+    # Router top-k scores aligned row-for-row with ``routed_experts``.
+    # None when score capture is disabled.
+    routed_expert_scores: np.ndarray | None = None
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0

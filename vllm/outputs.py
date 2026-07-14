@@ -43,6 +43,9 @@ class CompletionOutput:
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    # Router top-k scores aligned with routed_experts; None unless
+    # enable_return_routed_expert_scores is set. [seq_len,layer_num,topk]
+    routed_expert_scores: np.ndarray | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
