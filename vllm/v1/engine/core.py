@@ -119,6 +119,9 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        from vllm.tokenmoe_trace import prepare_engine
+
+        prepare_engine(vllm_config)
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -597,7 +600,18 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        trace = getattr(self.scheduler, "tokenmoe_trace", None)
+        if trace is not None:
+            trace.begin_step(time.monotonic_ns())
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        if trace is not None:
+            running, waiting = self.scheduler.get_request_counts()
+            trace.dispatch(
+                time.monotonic_ns(),
+                running,
+                waiting,
+                self.scheduler.get_kv_cache_usage(),
+            )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -608,12 +622,17 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        if trace is not None:
+            trace.output_ready(time.monotonic_ns())
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if trace is not None:
+            trace.end_step(time.monotonic_ns())
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0

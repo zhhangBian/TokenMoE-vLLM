@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -554,6 +556,7 @@ def triton_kernel_moe_forward(
     unpadded_K_w1=None,
     unpadded_N_w2=None,
     unpadded_K_w2=None,
+    capture_fn: Callable[[torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     sm_first = not renormalize
 
@@ -566,9 +569,22 @@ def triton_kernel_moe_forward(
     if use_legacy_triton_kernels and expert_map is None:
         from triton_kernels.routing import routing as fused_routing
 
-        routing_data, gather_idx, scatter_idx = fused_routing(
-            gating_output, topk, sm_first=sm_first
-        )
+        if capture_fn is None:
+            routing_data, gather_idx, scatter_idx = fused_routing(
+                gating_output, topk, sm_first=sm_first
+            )
+        else:
+            from triton_kernels.routing import routing_from_bitmatrix
+            from triton_kernels.topk import topk as topk_fn
+
+            logits = torch.softmax(gating_output, dim=-1) if sm_first else gating_output
+            expt_scal, expt_indx, bitmatrix = topk_fn(
+                logits, topk, apply_softmax=not sm_first, y_indx=None, n_rows=None
+            )
+            capture_fn(expt_indx)
+            routing_data, gather_idx, scatter_idx = routing_from_bitmatrix(
+                bitmatrix, expt_scal, expt_indx, logits.shape[-1], topk
+            )
         effective_expert_map = None
         effective_global_num_experts = global_num_experts
     else:
@@ -586,6 +602,9 @@ def triton_kernel_moe_forward(
             topk_ids_raw = topk_result.indx
         else:
             topk_weights, topk_ids_raw, _ = topk_result
+
+        if capture_fn is not None:
+            capture_fn(topk_ids_raw)
 
         if expert_map is not None:
             # topk_ids_raw contains global expert IDs - remap to local.
@@ -1319,6 +1338,9 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
 class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
     """Monolithic Triton MXFP4 expert. Wraps triton_kernel_moe_forward()."""
 
+    def supports_routing_replay_capture(self) -> bool:
+        return True
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -1411,6 +1433,7 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             w1=w1,
             w2=w2,
             gating_output=router_logits,
+            capture_fn=self.routing_replay_capture_fn,
             topk=self.topk,
             renormalize=self.renormalize,
             global_num_experts=global_num_experts,

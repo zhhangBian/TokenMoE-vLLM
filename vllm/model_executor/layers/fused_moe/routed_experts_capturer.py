@@ -260,9 +260,11 @@ def bind_routed_experts_capturer(
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
     num_bound = 0
+    bound_layers: dict[int, str] = {}
     for module in model.modules():
         if isinstance(module, RoutedExpertsCaptureSource):
             module.capture_fn = partial(capturer.capture, module.layer_id)
+            bound_layers[module.layer_id] = "capture_source"
             num_bound += 1
             continue
         if not isinstance(module, MoERunner):
@@ -290,9 +292,11 @@ def bind_routed_experts_capturer(
                     f"MoE kernel {type(fused_experts).__name__}."
                 )
             fused_experts.set_capture_fn(capture_fn)
+            bound_layers[layer_id] = "monolithic"
             num_bound += 1
         elif isinstance(module.router, BaseRouter):
             module.router.set_capture_fn(capture_fn)
+            bound_layers[layer_id] = "router"
             num_bound += 1
         else:
             raise ValueError(
@@ -302,6 +306,16 @@ def bind_routed_experts_capturer(
 
     if num_bound == 0:
         raise ValueError("No supported MoE router found for routed-experts capture.")
+
+    if get_tp_group().rank_in_group == 0:
+        from vllm.tokenmoe_trace import write_layer_map
+
+        write_layer_map(
+            [
+                {"layer_id": layer_id, "capture_path": path}
+                for layer_id, path in sorted(bound_layers.items())
+            ]
+        )
 
 
 def get_routed_experts_attn_gid(kv_cache_config: KVCacheConfig) -> int:

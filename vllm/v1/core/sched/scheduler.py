@@ -406,6 +406,10 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+        from vllm.tokenmoe_trace import TraceRecorder
+
+        self.tokenmoe_trace = TraceRecorder.from_config(vllm_config, block_size)
+
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
@@ -1494,6 +1498,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
+        if self.tokenmoe_trace is not None:
+            self.tokenmoe_trace.preempt(request)
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
@@ -1530,6 +1536,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if self.tokenmoe_trace is not None:
+                self.tokenmoe_trace.schedule(request, num_scheduled_token)
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -1936,6 +1944,11 @@ class Scheduler(SchedulerInterface):
                 routing_offsets[rid] = offset
                 offset += num_scheduled_tokens[rid]
 
+        if self.tokenmoe_trace is not None:
+            self.tokenmoe_trace.capture_step(routing_data, routing_offsets)
+            for rid in num_scheduled_tokens:
+                self._re_block_ids.pop(rid, None)
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2035,6 +2048,8 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
+                if self.tokenmoe_trace is not None and new_token_ids:
+                    self.tokenmoe_trace.first_token(request)
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2067,6 +2082,7 @@ class Scheduler(SchedulerInterface):
             routed_experts = None
             if (
                 self.enable_return_routed_experts
+                and self.tokenmoe_trace is None
                 and routing_data is not None
                 and new_token_ids
             ):
@@ -2486,6 +2502,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.tokenmoe_trace is not None:
+                self.tokenmoe_trace.add_request(request)
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -2563,6 +2581,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.tokenmoe_trace is not None:
+            self.tokenmoe_trace.finish_request(request)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2816,6 +2836,9 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.tokenmoe_trace is not None:
+            self.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+            self.tokenmoe_trace.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
